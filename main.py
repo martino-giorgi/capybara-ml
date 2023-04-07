@@ -1,36 +1,39 @@
-"""
-Todo:
-- Check ResNet
-- Check TensorBoard
-"""
-
+import datetime
 import pandas as pd
 import os
 import shutil
+from matplotlib import pyplot as plt
 import pydicom
 import numpy as np
 from PIL import Image
 from pathlib import Path
+import sklearn
 import tensorflow as tf
 from keras.callbacks import EarlyStopping
 from keras.optimizers import Adam
 import cv2
 
 from keras.models import Sequential
-from keras.layers import Dense, Dropout, Activation, Flatten, Conv2D, MaxPooling2D, RandomRotation, RandomTranslation, RandomContrast, BatchNormalization
+from keras.layers import Dense, RandomBrightness, RandomZoom, Dropout, Activation, Flatten, Conv2D, MaxPooling2D, RandomRotation, RandomTranslation, RandomContrast, BatchNormalization, GlobalAveragePooling2D
+
+from utils.utils import make_confusion_matrix, plot_to_image
 
 
 os.environ['CUDA_VISIBLE_DEVICES'] = "1"
 
-batch_size = 16
-epochs = 500
-img_width = 227
-img_height = 227
+batch_size = 1
+epochs = 100
+img_width = 300
+img_height = 300
+
 
 data_augmentation = tf.keras.Sequential([
-    RandomRotation(0.4, fill_mode='nearest'),
-    # RandomTranslation(0.2,0.2, fill_mode='nearest'),
-    RandomContrast(0.4),
+    RandomRotation(0.1, fill_mode='nearest'),
+    RandomTranslation(0.05,0.05, fill_mode='nearest'),
+    RandomContrast(0.2),
+    RandomZoom(0.1),
+    RandomBrightness(0.2)
+    
 ])
 
 
@@ -100,6 +103,33 @@ def load_model():
     return model
 
 
+def load_model_tl():
+    demo_resnet_model = Sequential()
+    demo_resnet_model.add(data_augmentation)
+    pretrained_model_for_demo = tf.keras.applications.ResNetRS50(include_top=False,
+                                                                  input_shape=(
+                                                                      img_width, img_height, 3),
+                                                                  weights='imagenet',
+                                                                  classes=11)
+    pretrained_model_for_demo.trainable = False
+
+    demo_resnet_model.add(pretrained_model_for_demo)
+    demo_resnet_model.add(Flatten())
+
+    demo_resnet_model.add(Dense(units=1024))
+    demo_resnet_model.add(Activation('relu'))
+    demo_resnet_model.add(Dropout(0.4))
+
+    demo_resnet_model.add(Dense(units=512))
+    demo_resnet_model.add(Activation('relu'))
+    demo_resnet_model.add(Dropout(0.4))
+
+    demo_resnet_model.add(Dense(units=11))
+    demo_resnet_model.add(Activation('softmax'))
+
+    return demo_resnet_model
+
+
 def sort_images():
     df = pd.read_excel("/home/mialab23.team1/data/SCQM.xlsx",
                        usecols=["img_uid", "diagnostic_image_type"])
@@ -128,14 +158,14 @@ def sort_images():
 
                 final_image = Image.fromarray(new_image)
 
-                final_image.save(f'{path}/{image}.png')
+                final_image.save(f'{path}/{image}.jpeg')
                 os.remove(f"{path}/{image}.dcm")
             except Exception as e:
                 print(e)
 
+
 # un-comment only first time
 # sort_images()
-
 
 train_ds, validation_ds = tf.keras.utils.image_dataset_from_directory(
     "data/",
@@ -144,14 +174,13 @@ train_ds, validation_ds = tf.keras.utils.image_dataset_from_directory(
     seed=12,
     shuffle=True,
     subset="both",
-    image_size=(img_width, img_height),
-)
-
+    image_size=(img_width, img_height))
 
 validation_ds, test_ds = tf.keras.utils.split_dataset(
     validation_ds, left_size=0.5, shuffle=True)
 
-model = load_model()
+# model = load_model()
+model = load_model_tl()
 
 model.compile(optimizer=Adam(learning_rate=0.0001),
               loss='sparse_categorical_crossentropy',
@@ -161,12 +190,50 @@ model.compile(optimizer=Adam(learning_rate=0.0001),
 early_stop = EarlyStopping(monitor='val_accuracy',
                            patience=20, restore_best_weights=True)
 
+logdir = "logs/image/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir = logdir, histogram_freq = 1)
+file_writer_cm = tf.summary.create_file_writer(logdir + '/cm')
+
+test_images = np.concatenate([x for x, y in test_ds], axis=0)
+test_labels = np.concatenate([y for x, y in test_ds], axis=0)
+class_names = ['Both Feet Combined', 'Both Hands Combined', 'Cervical Spine Lateral', 'Left Foot', 'Left Hand', 'Lumbar Spine Ap', 'Lumbar Spine Lateral', 'Pelvis Ap', 'Pelvis Lumbar Spine Combined', 'Right Foot', 'Right Hand']
+
+def log_confusion_matrix(epoch, logs):
+    
+    # Use the model to predict the values from the test_images.
+    test_pred_raw = model.predict(test_images)
+    
+    test_pred = np.argmax(test_pred_raw, axis=1)
+    
+    # Calculate the confusion matrix using sklearn.metrics
+    cm = sklearn.metrics.confusion_matrix(test_labels, test_pred)
+    
+    figure = make_confusion_matrix(cm, categories=class_names)
+    cm_image = plot_to_image(figure)
+    
+    # Log the confusion matrix as an image summary.
+    with file_writer_cm.as_default():
+        tf.summary.image("Confusion Matrix", cm_image, step=epoch)
+
+cm_callback = tf.keras.callbacks.LambdaCallback(on_epoch_end=log_confusion_matrix)
+
 history = model.fit(train_ds,
                     batch_size=batch_size,
                     epochs=epochs,
                     validation_data=validation_ds,
-                    callbacks=[early_stop])
+                    callbacks=[early_stop, tensorboard_callback, cm_callback])
 
 score = model.evaluate(test_ds)
 
+print('Test loss:', score[0])
+print('Test accuracy:', score[1])
+
 model.save('deliverable/model.h5')
+
+plt.plot(history.history['accuracy'])
+plt.plot(history.history['val_accuracy'])
+plt.title('model accuracy')
+plt.ylabel('accuracy')
+plt.xlabel('epoch')
+plt.legend(['train', 'val'], loc='upper left')
+plt.savefig('accuracy.png')
